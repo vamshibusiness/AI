@@ -1,15 +1,56 @@
-
-# Local environments
+# Environments
 .venv/
+env/
+venv/
 
-# Frontend dependencies
+# Frontend dependencies & build
 frontend/node_modules/
+node_modules/
+dist/
+build/
 
-# Local Google OAuth credentials
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Local Google OAuth & secrets
+.env
+*.env
 backend/config/google_credentials.json
 backend/config/token.json
+google_credentials.json
+token.json
+*.pem
+*.key
 
-.venv/
-frontend/node_modules/
-backend/config/google_credentials.json
-backend/config/token.json
+# Runtime stores & databases
+backend/assets/memory/jarvis_memory.db
+backend/assets/memory/jarvis_memory.faiss
+backend/assets/memory/jarvis_memory_meta.pkl
+backend/assets/rag/jarvis_docs.faiss
+backend/assets/rag/jarvis_docs.pkl
+backend/assets/rag/uploaded/
+backend/assets/user_profile.json
+backend/assets/action_log.jsonl
+active_research.json
+research_history.json
+inbox.json
+tasks.json
+
+# Test & coverage caches
+.pytest_cache/
+.coverage
+
+# Temporary files & screenshots
+*.tmp
+temp/
+scratch/
+Pictures/Jarvis/
+logs/
+recovery/
+original_source/
+
+# Feature-source reference repos (local only, never commit)
+integrations/
