@@ -1,0 +1,15 @@
+
+# Local environments
+.venv/
+
+# Frontend dependencies
+frontend/node_modules/
+
+# Local Google OAuth credentials
+backend/config/google_credentials.json
+backend/config/token.json
+
+.venv/
+frontend/node_modules/
+backend/config/google_credentials.json
+backend/config/token.json
