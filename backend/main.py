@@ -26,6 +26,7 @@ from backend.modules.memory.memory_store import (
 )
 from backend.modules.voice.tts import stop_speaking, is_speaking
 from backend.security import redact_secrets
+from backend.router.intent_router import route_command
 
 
 # Background task references
@@ -582,4 +583,73 @@ async def vision_ocr():
     res = extract_screen_text()
     return res
 
+
+# ==============================================================
+# CHAT ENDPOINT — Text-based conversation (UI chat panel)
+# ==============================================================
+
+# In-process short-term conversation history (resets on backend restart)
+_chat_history: list = []
+
+
+@app.post("/chat")
+async def chat(body: dict):
+    """
+    Accept a text message from the UI chat panel, route it through the
+    existing JARVIS intent router, and return the text response.
+
+    Also broadcasts user + assistant messages via WebSocket so all
+    connected clients (including multi-tab) stay in sync.
+
+    Body: { "message": "...", "session_id": "..." }
+    Returns: { "ok": true, "response": "...", "status": "..." }
+    """
+    global _chat_history
+
+    message = (body.get("message") or "").strip()
+    if not message:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Message is required."})
+
+    # Broadcast: user is typing / thinking starts
+    await broadcast_status("thinking")
+    await broadcast_message({
+        "type": "chat_message",
+        "role": "user",
+        "content": redact_secrets(message),
+    })
+
+    try:
+        # Route through the existing intent system (same as voice pipeline)
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: route_command(message, _chat_history),
+        )
+
+        # Persist conversation turn in memory store
+        add_conversation_turn("ui_chat", "user", message)
+        add_conversation_turn("ui_chat", "assistant", response or "")
+
+        # Keep a short rolling in-memory history for context
+        _chat_history.append({"role": "user", "content": message})
+        _chat_history.append({"role": "assistant", "content": response or ""})
+        if len(_chat_history) > 20:
+            _chat_history = _chat_history[-20:]
+
+        # Broadcast the assistant reply
+        await broadcast_message({
+            "type": "chat_message",
+            "role": "assistant",
+            "content": response or "I'm sorry, I couldn't process that request.",
+        })
+
+        await broadcast_status("idle")
+
+        return {
+            "ok": True,
+            "response": response,
+        }
+
+    except Exception as e:
+        await broadcast_status("idle")
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
