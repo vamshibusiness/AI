@@ -60,6 +60,21 @@ def dispatch(tool: str, arguments: dict = None) -> dict:
     """
     if arguments is None:
         arguments = {}
+    elif isinstance(arguments, str):
+        if tool in ("open_application", "close_application"):
+            arguments = {"application": arguments}
+        elif tool in ("open_website", "web_search"):
+            arguments = {"site": arguments, "query": arguments}
+        elif tool == "type_text":
+            arguments = {"text": arguments}
+        elif tool == "press_key":
+            arguments = {"key": arguments}
+        elif tool in ("open_folder", "list_files"):
+            arguments = {"location": arguments}
+        else:
+            arguments = {"target": arguments}
+    elif not isinstance(arguments, dict):
+        arguments = {}
 
     if tool not in TOOL_MAP:
         return {

@@ -1,238 +1,1173 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import "./App.css";
+import {
+  PlusIcon,
+  SearchIcon,
+  MessageSquareIcon,
+  TrashIcon,
+  BookOpenIcon,
+  BrainIcon,
+  BarChartIcon,
+  CompassIcon,
+  PaperclipIcon,
+  MicIcon,
+  SendIcon,
+  SquareIcon,
+  CloseIcon,
+  MenuIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  FileTextIcon,
+  UploadCloudIcon,
+  SparklesIcon,
+  AlertTriangleIcon,
+  VolumeIcon,
+} from "./icons.jsx";
 
 const API_BASE = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/ws";
 
-// ── Helpers ──────────────────────────────────────────────────
-const genId = () => Math.random().toString(36).slice(2, 10);
-const now = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const STORAGE_KEY = "jarvis_conversations_v4";
+const genId = () => "msg_" + Math.random().toString(36).slice(2, 10) + "_" + Date.now().toString(36);
+const fmtTime = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-function loadSessions() {
-  try { return JSON.parse(localStorage.getItem("jarvis_sessions") || "{}"); }
-  catch { return {}; }
-}
-function saveSessions(sessions) {
-  try { localStorage.setItem("jarvis_sessions", JSON.stringify(sessions)); } catch {}
+function loadSessionsFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && Object.keys(parsed).length > 0) {
+        return parsed;
+      }
+    }
+  } catch {}
+  const initialId = "chat_" + Date.now();
+  const initial = {
+    [initialId]: {
+      id: initialId,
+      name: "New Chat",
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+  };
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(initial)); } catch {}
+  return initial;
 }
 
-// ── Simple Markdown renderer (no external deps) ───────────────
+function saveSessionsToStorage(sessions) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); } catch {}
+}
+
+// ── Markdown Parser (Zero Emojis, Clean Code Cards) ───────────
 function renderMarkdown(text) {
   if (!text) return "";
-  return text
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    // code blocks
-    .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
-      `<pre class="code-block" data-lang="${lang || "code"}"><code>${code.trim()}</code></pre>`)
-    // inline code
-    .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-    // bold
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    // italic
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    // headers
-    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2>$2</h2>")
-    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
-    // bullet lists
-    .replace(/^[-•] (.+)$/gm, "<li>$1</li>")
-    .replace(/(<li>.*<\/li>\n?)+/g, s => `<ul>${s}</ul>`)
-    // numbered lists
-    .replace(/^\d+\. (.+)$/gm, "<li>$1</li>")
-    // line breaks
-    .replace(/\n\n/g, "</p><p>")
-    .replace(/\n/g, "<br/>");
+  let html = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  // Code blocks: ```lang ... ```
+  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const cleanCode = code.trim();
+    const l = lang ? lang.toLowerCase() : "code";
+    return `<div class="code-block-card">
+      <div class="code-block-header">
+        <span class="code-block-lang">${l}</span>
+        <button class="copy-code-button" onclick="navigator.clipboard.writeText(decodeURIComponent('${encodeURIComponent(cleanCode)}')).then(()=>{this.innerText='Copied!';setTimeout(()=>this.innerText='Copy',1500)})">Copy</button>
+      </div>
+      <pre><code>${cleanCode}</code></pre>
+    </div>`;
+  });
+
+  // Inline code: `code`
+  html = html.replace(/`([^`]+)`/g, '<code class="code-inline">$1</code>');
+
+  // Bold & Italic
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  // Headers
+  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+
+  // Lists
+  html = html.replace(/^[-*•] (.+)$/gm, "<li>$1</li>");
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, "<ul>$&</ul>");
+
+  // Paragraphs
+  html = html.replace(/\n\n/g, "</p><p>");
+  html = html.replace(/\n/g, "<br/>");
+
+  return `<p>${html}</p>`;
 }
 
-// ── Message bubble ────────────────────────────────────────────
-function MessageBubble({ msg }) {
-  const [copied, setCopied] = useState(false);
+export default function App() {
+  // ── Connection & Assistant State ──
+  const [status, setStatus] = useState("idle");
+  const [backendOnline, setBackendOnline] = useState(false);
+  const [agentActionStatus, setAgentActionStatus] = useState(null); // { type, status, message, success }
 
-  const copyCode = (code) => {
-    navigator.clipboard.writeText(code).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+  // ── Layout & Modals ──
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [activeModal, setActiveModal] = useState(null); // null | 'rag' | 'memory' | 'stats' | 'research'
+
+  // ── Voice Assistant Overlay ──
+  const [voiceOverlayActive, setVoiceOverlayActive] = useState(false);
+
+  // ── Chat Sessions ──
+  const [sessions, setSessions] = useState(() => loadSessionsFromStorage());
+  const [currentSessionId, setCurrentSessionId] = useState(() => {
+    const s = loadSessionsFromStorage();
+    const ids = Object.keys(s);
+    return ids[ids.length - 1] || "chat_default";
+  });
+  const [chatSearch, setChatSearch] = useState("");
+
+  // ── Message Input ──
+  const [inputText, setInputText] = useState("");
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [toastMessage, setToastMessage] = useState(null);
+
+  // ── Modules Data ──
+  const [ragDocs, setRagDocs] = useState([]);
+  const [ragUploading, setRagUploading] = useState(false);
+  const [memories, setMemories] = useState([]);
+  const [systemStats, setSystemStats] = useState(null);
+  const [researchSummary, setResearchSummary] = useState({ completed_count: 0, active_count: 0 });
+  const [completedResearch, setCompletedResearch] = useState([]);
+  const [pendingDelete, setPendingDelete] = useState(null);
+
+  // ── Refs ──
+  const messagesEndRef = useRef(null);
+  const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const wsRef = useRef(null);
+
+  const normalizedStatus = status === "online" ? "idle" : status;
+  const currentSession = sessions[currentSessionId] || { id: currentSessionId, messages: [] };
+  const messages = currentSession.messages || [];
+
+  // Scroll to bottom on new messages
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length, isStreaming]);
+
+  const showToast = (msg, duration = 3200) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), duration);
+  };
+
+  // ── Session Management (Strict Deduplication) ─────────────────
+  const addMessageToSession = useCallback((sessionId, message) => {
+    setSessions(prev => {
+      const sess = prev[sessionId] || {
+        id: sessionId,
+        name: "New Chat",
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      // Strict Deduplication Rule 1: ID uniqueness
+      if (message.id && sess.messages.some(m => m.id === message.id)) {
+        return prev;
+      }
+
+      // Strict Deduplication Rule 2: same content within 3s
+      const last = sess.messages[sess.messages.length - 1];
+      if (
+        last &&
+        last.role === message.role &&
+        last.content === message.content &&
+        Math.abs(Date.now() - (last.timestamp || 0)) < 3000
+      ) {
+        return prev;
+      }
+
+      const stamped = {
+        ...message,
+        id: message.id || genId(),
+        timestamp: message.timestamp || Date.now(),
+        time: message.time || fmtTime(),
+      };
+
+      let newName = sess.name;
+      if (sess.name === "New Chat" && stamped.role === "user") {
+        newName = stamped.content.slice(0, 30).trim() || "New Chat";
+      }
+
+      const updated = {
+        ...prev,
+        [sessionId]: {
+          ...sess,
+          messages: [...sess.messages, stamped],
+          name: newName,
+          updatedAt: Date.now(),
+        },
+      };
+
+      saveSessionsToStorage(updated);
+      return updated;
+    });
+  }, []);
+
+  const updateAssistantMessageChunk = useCallback((sessionId, messageId, chunk, isDone = false) => {
+    setSessions(prev => {
+      const sess = prev[sessionId];
+      if (!sess) return prev;
+
+      const updatedMessages = sess.messages.map(m => {
+        if (m.id === messageId) {
+          return {
+            ...m,
+            content: m.content + chunk,
+            isStreaming: !isDone,
+          };
+        }
+        return m;
+      });
+
+      const updated = {
+        ...prev,
+        [sessionId]: {
+          ...sess,
+          messages: updatedMessages,
+          updatedAt: Date.now(),
+        },
+      };
+
+      if (isDone) {
+        saveSessionsToStorage(updated);
+      }
+      return updated;
+    });
+  }, []);
+
+  const createNewChat = () => {
+    const newId = "chat_" + Date.now();
+    const newSession = {
+      id: newId,
+      name: "New Chat",
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setSessions(prev => {
+      const updated = { ...prev, [newId]: newSession };
+      saveSessionsToStorage(updated);
+      return updated;
+    });
+    setCurrentSessionId(newId);
+    setInputText("");
+    setTimeout(() => textareaRef.current?.focus(), 50);
+  };
+
+  const deleteChat = (id, e) => {
+    e.stopPropagation();
+    setSessions(prev => {
+      const updated = { ...prev };
+      delete updated[id];
+      const remainingIds = Object.keys(updated);
+      if (remainingIds.length === 0) {
+        const freshId = "chat_" + Date.now();
+        updated[freshId] = {
+          id: freshId,
+          name: "New Chat",
+          messages: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        setCurrentSessionId(freshId);
+      } else if (currentSessionId === id) {
+        setCurrentSessionId(remainingIds[remainingIds.length - 1]);
+      }
+      saveSessionsToStorage(updated);
+      return updated;
     });
   };
 
-  const isUser = msg.role === "user";
+  // ── Loaders ───────────────────────────────────────────────────
+  const fetchRagDocs = () => {
+    fetch(`${API_BASE}/rag/documents`)
+      .then(r => r.json())
+      .then(d => { if (d.ok) setRagDocs(d.documents || []); })
+      .catch(() => {});
+  };
 
-  return (
-    <div className={`msg-row ${isUser ? "msg-user" : "msg-jarvis"}`}>
-      {!isUser && (
-        <div className="avatar avatar-jarvis" title="JARVIS">J</div>
-      )}
-      <div className={`bubble ${isUser ? "bubble-user" : "bubble-jarvis"}`}>
-        {isUser ? (
-          <span>{msg.content}</span>
-        ) : (
-          <div
-            className="bubble-md"
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-          />
-        )}
-        {msg.citations?.length > 0 && (
-          <div className="citation-row">
-            {msg.citations.map((c, i) => (
-              <span key={i} className="citation-chip">
-                📄 {c.source}{c.page ? ` p.${c.page}` : ""}
-              </span>
-            ))}
-          </div>
-        )}
-        <div className="msg-meta">{msg.time || ""}</div>
-      </div>
-      {isUser && (
-        <div className="avatar avatar-user" title="You">V</div>
-      )}
-    </div>
-  );
-}
+  const fetchMemories = () => {
+    fetch(`${API_BASE}/memory/all`)
+      .then(r => r.json())
+      .then(d => { if (d.ok) setMemories(d.memories || []); })
+      .catch(() => {});
+  };
 
-// ── Typing indicator ─────────────────────────────────────────
-function TypingIndicator() {
-  return (
-    <div className="msg-row msg-jarvis">
-      <div className="avatar avatar-jarvis">J</div>
-      <div className="bubble bubble-jarvis typing-bubble">
-        <span className="dot" /><span className="dot" /><span className="dot" />
-      </div>
-    </div>
-  );
-}
+  const fetchSystemStats = () => {
+    fetch(`${API_BASE}/system/stats`)
+      .then(r => r.json())
+      .then(d => { if (d.ok) setSystemStats(d); })
+      .catch(() => {});
+  };
 
-// ── Status pill ───────────────────────────────────────────────
-const STATUS_LABELS = {
-  idle: "● Online",
-  listening: "🎙 Listening",
-  thinking: "⚡ Thinking",
-  speaking: "🔊 Speaking",
-  "checking-email": "✉ Checking Email",
-  offline: "○ Offline",
-};
-const STATUS_COLORS = {
-  idle: "#22d3ee",
-  listening: "#a78bfa",
-  thinking: "#fbbf24",
-  speaking: "#34d399",
-  "checking-email": "#60a5fa",
-  offline: "#6b7280",
-};
+  const fetchResearchSummary = () => {
+    fetch(`${API_BASE}/research/summary`)
+      .then(r => r.json())
+      .then(d => setResearchSummary({ completed_count: d.completed_count || 0, active_count: d.active_count || 0 }))
+      .catch(() => {});
+  };
 
-// ── RAG Panel ─────────────────────────────────────────────────
-function RagPanel({ ragDocs, loadRagDocs }) {
-  const [ragQueryText, setRagQueryText] = useState("");
-  const [ragResult, setRagResult] = useState(null);
-  const [ragLoading, setRagLoading] = useState(false);
-  const [ragUploading, setRagUploading] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
-  const fileInputRef = useRef(null);
+  // ── WebSocket Lifecycle ───────────────────────────────────────
+  useEffect(() => {
+    let reconnectTimer = null;
+    let isMounted = true;
 
-  const uploadFile = (file) => {
+    const connectWS = () => {
+      if (!isMounted) return;
+      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      try {
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (!isMounted) return;
+          setBackendOnline(true);
+        };
+
+        ws.onmessage = (e) => {
+          if (!isMounted) return;
+          try {
+            const data = JSON.parse(e.data);
+
+            if (data.status) {
+              const s = data.status.toLowerCase();
+              setStatus(s);
+              // Auto-open voice overlay if voice wake-word triggers listening or speaking
+              if (s === "listening" || s === "speaking") {
+                setVoiceOverlayActive(true);
+              } else if (s === "idle") {
+                // Auto-close overlay after brief settle
+                setTimeout(() => {
+                  setVoiceOverlayActive(false);
+                  setAgentActionStatus(null);
+                }, 3000);
+              }
+            }
+
+            if (data.type === "computer_action_status") {
+              setAgentActionStatus(data);
+              setVoiceOverlayActive(true);
+              if (data.status === "done" || data.status === "failed") {
+                setTimeout(() => setAgentActionStatus(null), 4000);
+              }
+            }
+
+            if (data.type === "confirm_delete") {
+              setPendingDelete(data);
+            }
+
+            if (data.type === "rag_document_indexed") {
+              fetchRagDocs();
+              showToast("Document indexed in Knowledge Base.");
+            }
+
+            if (data.type === "show_completed_research") {
+              setCompletedResearch(data.items || []);
+              setActiveModal("research");
+              fetchResearchSummary();
+            }
+
+            if (data.type === "research_summary") {
+              setResearchSummary({ completed_count: data.completed_count || 0, active_count: data.active_count || 0 });
+            }
+          } catch {}
+        };
+
+        ws.onclose = () => {
+          if (!isMounted) return;
+          setBackendOnline(false);
+          setStatus("offline");
+          wsRef.current = null;
+          reconnectTimer = setTimeout(connectWS, 4000);
+        };
+
+        ws.onerror = () => {
+          ws.close();
+        };
+      } catch {
+        reconnectTimer = setTimeout(connectWS, 4000);
+      }
+    };
+
+    connectWS();
+    fetchRagDocs();
+    fetchMemories();
+    fetchSystemStats();
+    fetchResearchSummary();
+
+    const statsTimer = setInterval(fetchSystemStats, 6000);
+    const researchTimer = setInterval(fetchResearchSummary, 10000);
+
+    return () => {
+      isMounted = false;
+      clearTimeout(reconnectTimer);
+      clearInterval(statsTimer);
+      clearInterval(researchTimer);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, []);
+
+  // ── MODE A: CHAT MODE (PROGRESSIVE SSE STREAMING — NO TTS) ─────
+  const handleSendMessage = async (e) => {
+    if (e) e.preventDefault();
+    const text = inputText.trim();
+    if (!text || isStreaming || normalizedStatus === "offline") return;
+
+    const userMsgId = genId();
+    const assistantMsgId = genId();
+
+    // 1. Append user message ONCE
+    addMessageToSession(currentSessionId, {
+      id: userMsgId,
+      role: "user",
+      content: text,
+      time: fmtTime(),
+      timestamp: Date.now(),
+    });
+
+    setInputText("");
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+    setIsStreaming(true);
+
+    // 2. Append empty assistant message ready to receive streaming chunks
+    addMessageToSession(currentSessionId, {
+      id: assistantMsgId,
+      role: "assistant",
+      content: "",
+      time: fmtTime(),
+      timestamp: Date.now(),
+      isStreaming: true,
+    });
+
+    try {
+      const response = await fetch(`${API_BASE}/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          session_id: currentSessionId,
+          msg_id: assistantMsgId,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned HTTP ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const payload = JSON.parse(line.slice(6));
+              if (payload.chunk) {
+                updateAssistantMessageChunk(currentSessionId, assistantMsgId, payload.chunk, false);
+              }
+              if (payload.done) {
+                updateAssistantMessageChunk(currentSessionId, assistantMsgId, "", true);
+              }
+              if (payload.error) {
+                updateAssistantMessageChunk(currentSessionId, assistantMsgId, `\n\n*Error: ${payload.error}*`, true);
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // Finalize message stream
+      updateAssistantMessageChunk(currentSessionId, assistantMsgId, "", true);
+    } catch (err) {
+      updateAssistantMessageChunk(
+        currentSessionId,
+        assistantMsgId,
+        `Could not reach the JARVIS backend mainframe (${err.message}).`,
+        true
+      );
+    } finally {
+      setIsStreaming(false);
+      setTimeout(() => textareaRef.current?.focus(), 50);
+    }
+  };
+
+  // ── MODE B: VOICE MODE (MICROPHONE & OVERLAY) ─────────────────
+  const handleMicToggle = () => {
+    if (normalizedStatus === "speaking") {
+      // Silence active speech
+      fetch(`${API_BASE}/voice/stop`, { method: "POST" }).catch(() => {});
+      setStatus("idle");
+      setVoiceOverlayActive(false);
+      showToast("JARVIS voice output silenced.");
+    } else {
+      // Activate voice listening
+      setVoiceOverlayActive(true);
+      fetch(`${API_BASE}/voice/trigger`, { method: "POST" })
+        .then(r => r.json())
+        .then(d => {
+          if (d.ok) showToast("Voice Mode activated. Speak naturally.");
+        })
+        .catch(() => showToast("Could not activate voice listening."));
+    }
+  };
+
+  const handleSilenceVoice = () => {
+    fetch(`${API_BASE}/voice/stop`, { method: "POST" }).catch(() => {});
+    setStatus("idle");
+    setVoiceOverlayActive(false);
+    showToast("JARVIS voice silenced.");
+  };
+
+  // Keyboard shortcut: Space to silence active voice
+  useEffect(() => {
+    const onKey = (e) => {
+      if (
+        e.code === "Space" &&
+        normalizedStatus === "speaking" &&
+        document.activeElement?.tagName !== "INPUT" &&
+        document.activeElement?.tagName !== "TEXTAREA"
+      ) {
+        e.preventDefault();
+        handleSilenceVoice();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [normalizedStatus]);
+
+  // ── Document Attachment Upload (RAG) ──────────────────────────
+  const handleFileUpload = (e) => {
+    const file = e.target.files?.[0];
     if (!file) return;
+
     const allowed = [".pdf", ".txt", ".md", ".markdown", ".csv"];
     const ext = "." + file.name.split(".").pop().toLowerCase();
     if (!allowed.includes(ext)) {
-      alert("Unsupported file type. Please upload PDF, TXT, MD, or CSV.");
+      alert("Unsupported file. Please select a PDF, TXT, MD, or CSV document.");
       return;
     }
+
     setRagUploading(true);
+    showToast(`Indexing "${file.name}" into Knowledge Base...`, 5000);
+
     const formData = new FormData();
     formData.append("file", file);
+
     fetch(`${API_BASE}/rag/upload`, { method: "POST", body: formData })
       .then(r => r.json())
-      .then(d => { setRagUploading(false); if (d.ok) loadRagDocs(); })
-      .catch(() => setRagUploading(false));
+      .then(d => {
+        setRagUploading(false);
+        if (d.ok) {
+          fetchRagDocs();
+          showToast(`"${file.name}" successfully indexed into Knowledge Base.`);
+        } else {
+          showToast(`Upload failed: ${d.error || "Unknown error"}`);
+        }
+      })
+      .catch(() => {
+        setRagUploading(false);
+        showToast("Upload failed: server connection error.");
+      });
+
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) uploadFile(file);
+  // ── Permanent Deletion Confirmation ───────────────────────────
+  const handleConfirmDelete = (confirmed) => {
+    if (!pendingDelete) return;
+    fetch(`${API_BASE}/computer/confirm-delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: pendingDelete.path, confirm: confirmed }),
+    }).catch(() => {});
+    setPendingDelete(null);
+    showToast(confirmed ? "Item deleted." : "Deletion cancelled.");
   };
 
-  const handleRagQuery = (e) => {
+  const filteredSessions = Object.values(sessions)
+    .filter(s => s.name?.toLowerCase().includes(chatSearch.toLowerCase()))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  return (
+    <div className="agent-shell">
+      {/* Hidden file input for attachment upload */}
+      <input
+        type="file"
+        ref={fileInputRef}
+        style={{ display: "none" }}
+        accept=".pdf,.txt,.md,.markdown,.csv"
+        onChange={handleFileUpload}
+      />
+
+      {/* ── LEFT COLLAPSIBLE SIDEBAR ── */}
+      <aside className={`agent-sidebar ${sidebarOpen ? "open" : "collapsed"}`}>
+        <div className="sidebar-top-bar">
+          <div className="sidebar-brand">
+            <div className="brand-badge">
+              <div className="brand-badge-ring" />
+              <span>J</span>
+            </div>
+            {sidebarOpen && <span className="brand-text">JARVIS</span>}
+          </div>
+          <button
+            className="sidebar-collapse-btn"
+            onClick={() => setSidebarOpen(v => !v)}
+            title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+          >
+            {sidebarOpen ? <ChevronLeftIcon /> : <ChevronRightIcon />}
+          </button>
+        </div>
+
+        {sidebarOpen && (
+          <>
+            {/* New Chat Button */}
+            <div className="sidebar-action-container">
+              <button className="new-chat-button" onClick={createNewChat}>
+                <PlusIcon />
+                <span>New chat</span>
+              </button>
+            </div>
+
+            {/* Chat Search */}
+            <div className="sidebar-search-container">
+              <div className="search-input-box">
+                <SearchIcon />
+                <input
+                  type="text"
+                  placeholder="Search conversations..."
+                  value={chatSearch}
+                  onChange={e => setChatSearch(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* Conversation History */}
+            <div className="sidebar-chats-scroll">
+              <div className="section-heading">Conversations</div>
+              {filteredSessions.map(sess => (
+                <div
+                  key={sess.id}
+                  className={`chat-session-row ${sess.id === currentSessionId ? "active" : ""}`}
+                  onClick={() => setCurrentSessionId(sess.id)}
+                >
+                  <MessageSquareIcon className="chat-row-icon" />
+                  <span className="chat-row-label">{sess.name}</span>
+                  <button
+                    className="chat-delete-button"
+                    onClick={e => deleteChat(sess.id, e)}
+                    title="Delete conversation"
+                  >
+                    <TrashIcon />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {/* Assistant Tools Navigation */}
+            <div className="sidebar-tools-container">
+              <div className="section-heading">Assistant Tools</div>
+              <button
+                className={`tool-nav-btn ${activeModal === "rag" ? "active" : ""}`}
+                onClick={() => setActiveModal("rag")}
+              >
+                <div className="tool-nav-left">
+                  <BookOpenIcon />
+                  <span>Knowledge Base</span>
+                </div>
+                {ragDocs.length > 0 && <span className="tool-count-pill">{ragDocs.length}</span>}
+              </button>
+              <button
+                className={`tool-nav-btn ${activeModal === "memory" ? "active" : ""}`}
+                onClick={() => setActiveModal("memory")}
+              >
+                <div className="tool-nav-left">
+                  <BrainIcon />
+                  <span>Memory Vault</span>
+                </div>
+                {memories.length > 0 && <span className="tool-count-pill">{memories.length}</span>}
+              </button>
+              <button
+                className={`tool-nav-btn ${activeModal === "stats" ? "active" : ""}`}
+                onClick={() => setActiveModal("stats")}
+              >
+                <div className="tool-nav-left">
+                  <BarChartIcon />
+                  <span>System Stats</span>
+                </div>
+              </button>
+              {researchSummary.completed_count > 0 && (
+                <button
+                  className="tool-nav-btn"
+                  onClick={() => fetch(`${API_BASE}/research/show-completed`)}
+                >
+                  <div className="tool-nav-left">
+                    <CompassIcon />
+                    <span>Research Reports</span>
+                  </div>
+                  <span className="tool-count-pill">{researchSummary.completed_count}</span>
+                </button>
+              )}
+            </div>
+
+            {/* Sidebar Footer */}
+            <div className="sidebar-bottom-bar">
+              <div className="connection-status-indicator">
+                <span
+                  className="status-dot"
+                  style={{ background: backendOnline ? "#22d3ee" : "#ef4444" }}
+                />
+                <span className="status-label-text">
+                  {backendOnline ? "JARVIS Online" : "Backend Offline"}
+                </span>
+              </div>
+              <div className="developer-tag">Owner: Vamshi Krishna</div>
+            </div>
+          </>
+        )}
+      </aside>
+
+      {/* ── MAIN WORKSPACE (FULL WIDTH CHAT) ── */}
+      <main className="agent-main-view">
+        {/* Top Header Navbar */}
+        <header className="main-top-navbar">
+          <div className="top-nav-left">
+            {!sidebarOpen && (
+              <button
+                className="expand-sidebar-trigger"
+                onClick={() => setSidebarOpen(true)}
+                title="Expand sidebar"
+              >
+                <MenuIcon />
+              </button>
+            )}
+            <div className="model-chip">
+              <SparklesIcon />
+              <span>JARVIS • llama3.2:3b</span>
+            </div>
+          </div>
+
+          <div className="top-nav-right">
+            {/* Live Status Pill */}
+            <div className={`status-pill ${normalizedStatus}`}>
+              <span className="pill-dot" />
+              <span className="pill-text">{normalizedStatus.toUpperCase()}</span>
+            </div>
+
+            {/* Silence Button (visible when JARVIS is speaking in Voice Mode) */}
+            {normalizedStatus === "speaking" && (
+              <button className="silence-voice-trigger" onClick={handleSilenceVoice}>
+                <SquareIcon />
+                <span>Silence JARVIS</span>
+                <kbd>Space</kbd>
+              </button>
+            )}
+          </div>
+        </header>
+
+        {/* Conversation Message Stream */}
+        <div className="conversation-viewport">
+          {messages.length === 0 ? (
+            /* Clean Assistant Welcome Hero */
+            <div className="agent-welcome-hero">
+              <div className="welcome-orb-container">
+                <div className="welcome-ring ring-outer" />
+                <div className="welcome-ring ring-inner" />
+                <div className="welcome-core">J</div>
+              </div>
+              <h1 className="welcome-hero-title">How can I assist you today, sir?</h1>
+              <p className="welcome-hero-subtitle">
+                Local-First Autonomous AI Agent • Multi-step Computer Control, Voice, RAG & Memory
+              </p>
+
+              <div className="starter-prompts-grid">
+                {[
+                  { title: "Open Notepad and type Hello Vamshi", sub: "Multi-step computer control agent" },
+                  { title: "Search for today's AI news", sub: "Deep web research & synthesis" },
+                  { title: "What key facts do you remember about me?", sub: "Query long-term Memory Vault" },
+                  { title: "What is the weather forecast today?", sub: "Retrieve local meteorological report" },
+                ].map((p, idx) => (
+                  <div
+                    key={idx}
+                    className="starter-prompt-card"
+                    onClick={() => {
+                      setInputText(p.title);
+                      textareaRef.current?.focus();
+                    }}
+                  >
+                    <div className="starter-card-title">{p.title}</div>
+                    <div className="starter-card-sub">{p.sub}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            /* Messages Stream with Strict Left/Right Alignment */
+            <div className="messages-stream-list">
+              {messages.map(msg => {
+                const isUser = msg.role === "user";
+                return (
+                  <div
+                    key={msg.id}
+                    className={`message-turn-row ${isUser ? "user-side-row" : "jarvis-side-row"}`}
+                  >
+                    <div className="turn-card-wrapper">
+                      {/* Avatar */}
+                      <div className={`avatar-pill ${isUser ? "avatar-user" : "avatar-jarvis"}`}>
+                        {isUser ? "V" : "J"}
+                      </div>
+
+                      {/* Message Content Bubble */}
+                      <div className={`message-bubble ${isUser ? "user-bubble" : "jarvis-bubble"}`}>
+                        <div className="message-header-meta">
+                          <span className="sender-name">{isUser ? "Vamshi Krishna" : "JARVIS"}</span>
+                          <span className="sent-time">{msg.time}</span>
+                        </div>
+
+                        {isUser ? (
+                          <div className="user-raw-text">{msg.content}</div>
+                        ) : (
+                          <div
+                            className="jarvis-formatted-markdown"
+                            dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                          />
+                        )}
+
+                        {/* RAG Citations */}
+                        {msg.citations?.length > 0 && (
+                          <div className="citations-tray">
+                            {msg.citations.map((c, i) => (
+                              <span key={i} className="citation-tag">
+                                <FileTextIcon size={12} />
+                                <span>{c.source}{c.page ? ` p.${c.page}` : ""}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              <div ref={messagesEndRef} />
+            </div>
+          )}
+        </div>
+
+        {/* Floating Toast Notification */}
+        {toastMessage && (
+          <div className="floating-agent-toast">
+            <span>{toastMessage}</span>
+          </div>
+        )}
+
+        {/* ── CHATGPT-STYLE BOTTOM INPUT BAR ── */}
+        <div className="bottom-input-container">
+          <form className="input-bar-card" onSubmit={handleSendMessage}>
+            {/* Attachment Button (Uploads to RAG Knowledge Base) */}
+            <button
+              type="button"
+              className="action-icon-btn attachment-btn"
+              onClick={() => fileInputRef.current?.click()}
+              title="Upload document to Knowledge Base"
+              disabled={ragUploading}
+            >
+              <PaperclipIcon />
+            </button>
+
+            {/* Auto-expanding Message Textarea */}
+            <textarea
+              ref={textareaRef}
+              className="chat-textarea-field"
+              placeholder="Message JARVIS... (Enter to send, Shift+Enter for newline)"
+              rows={1}
+              value={inputText}
+              onChange={e => {
+                setInputText(e.target.value);
+                e.target.style.height = "auto";
+                e.target.style.height = Math.min(e.target.scrollHeight, 180) + "px";
+              }}
+              onKeyDown={e => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSendMessage();
+                }
+              }}
+              disabled={isStreaming || normalizedStatus === "offline"}
+            />
+
+            {/* Real Microphone Button (Activates Voice Mode) */}
+            <button
+              type="button"
+              className={`action-icon-btn mic-btn ${normalizedStatus}`}
+              onClick={handleMicToggle}
+              title={normalizedStatus === "speaking" ? "Silence JARVIS" : "Activate Voice Mode"}
+            >
+              {normalizedStatus === "speaking" ? <VolumeIcon /> : <MicIcon />}
+            </button>
+
+            {/* Send Button */}
+            <button
+              type="submit"
+              className="action-icon-btn send-btn"
+              disabled={isStreaming || !inputText.trim() || normalizedStatus === "offline"}
+              title="Send message"
+            >
+              <SendIcon />
+            </button>
+          </form>
+
+          <div className="bottom-sub-disclaimer">
+            JARVIS Local AI Agent • llama3.2:3b • Press Space to silence speech output
+          </div>
+        </div>
+      </main>
+
+      {/* ── MAX-STYLE FLOATING VOICE ASSISTANT OVERLAY ── */}
+      {voiceOverlayActive && (
+        <div className="voice-assistant-overlay-hud">
+          <div className="voice-hud-header">
+            <div className="voice-hud-brand">
+              <span className="hud-orb-dot" />
+              <span>JARVIS Assistant</span>
+            </div>
+            <button
+              className="voice-hud-close"
+              onClick={() => {
+                setVoiceOverlayActive(false);
+                if (normalizedStatus === "speaking") handleSilenceVoice();
+              }}
+              title="Close voice HUD"
+            >
+              <CloseIcon size={14} />
+            </button>
+          </div>
+
+          <div className="voice-hud-body">
+            {/* Animated Waveform Bars */}
+            <div className={`waveform-visualizer ${normalizedStatus}`}>
+              <span className="wave-bar bar-1" />
+              <span className="wave-bar bar-2" />
+              <span className="wave-bar bar-3" />
+              <span className="wave-bar bar-4" />
+              <span className="wave-bar bar-5" />
+            </div>
+
+            <div className="voice-hud-status-line">
+              {agentActionStatus ? (
+                <span className="action-status-msg">{agentActionStatus.message}</span>
+              ) : normalizedStatus === "listening" ? (
+                <span>Listening for speech...</span>
+              ) : normalizedStatus === "thinking" ? (
+                <span>Thinking & planning...</span>
+              ) : normalizedStatus === "speaking" ? (
+                <span>Speaking response...</span>
+              ) : (
+                <span>Standing by</span>
+              )}
+            </div>
+          </div>
+
+          {normalizedStatus === "speaking" && (
+            <div className="voice-hud-actions">
+              <button className="hud-silence-btn" onClick={handleSilenceVoice}>
+                <SquareIcon size={12} />
+                <span>Silence</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── OPTIONAL OVERLAY MODALS (CLOSED BY DEFAULT) ── */}
+
+      {/* 1. Knowledge Base (RAG) Modal */}
+      {activeModal === "rag" && (
+        <ModalContainer title="Knowledge Base (RAG)" onClose={() => setActiveModal(null)}>
+          <RagModalView
+            ragDocs={ragDocs}
+            fetchRagDocs={fetchRagDocs}
+            onSelectFile={() => fileInputRef.current?.click()}
+            ragUploading={ragUploading}
+          />
+        </ModalContainer>
+      )}
+
+      {/* 2. Memory Vault Modal */}
+      {activeModal === "memory" && (
+        <ModalContainer title="Memory Vault" onClose={() => setActiveModal(null)}>
+          <MemoryModalView memories={memories} fetchMemories={fetchMemories} />
+        </ModalContainer>
+      )}
+
+      {/* 3. System Stats Modal */}
+      {activeModal === "stats" && (
+        <ModalContainer title="Hardware & System Telemetry" onClose={() => setActiveModal(null)}>
+          <StatsModalView stats={systemStats} />
+        </ModalContainer>
+      )}
+
+      {/* 4. Research Reports Modal */}
+      {activeModal === "research" && (
+        <ModalContainer title="Completed Research Reports" onClose={() => setActiveModal(null)}>
+          <ResearchModalView items={completedResearch} />
+        </ModalContainer>
+      )}
+
+      {/* 5. Security Confirmation Modal for File Deletion */}
+      {pendingDelete && (
+        <div className="modal-backdrop-scrim">
+          <div className="modal-window-card danger-window">
+            <div className="danger-header-tag">
+              <AlertTriangleIcon />
+              <span>SECURITY CONFIRMATION REQUIRED</span>
+            </div>
+            <h2 className="modal-window-title">Confirm Permanent Deletion</h2>
+            <p className="modal-window-desc">
+              JARVIS is requesting permission to delete the following target on your Windows filesystem:
+            </p>
+            <div className="delete-target-preview">
+              <div className="target-name">{pendingDelete.name}</div>
+              <div className="target-path">{pendingDelete.path}</div>
+            </div>
+            <div className="modal-window-actions">
+              <button className="modal-action-btn danger-confirm" onClick={() => handleConfirmDelete(true)}>
+                Permanently Delete
+              </button>
+              <button className="modal-action-btn neutral-cancel" onClick={() => handleConfirmDelete(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Generic Modal Container ───────────────────────────────────
+function ModalContainer({ title, children, onClose }) {
+  return (
+    <div className="modal-backdrop-scrim" onClick={onClose}>
+      <div className="modal-window-card" onClick={e => e.stopPropagation()}>
+        <div className="modal-window-header">
+          <h2 className="modal-window-title">{title}</h2>
+          <button className="modal-close-trigger" onClick={onClose} title="Close">
+            <CloseIcon />
+          </button>
+        </div>
+        <div className="modal-window-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── RAG Modal Content View ────────────────────────────────────
+function RagModalView({ ragDocs, fetchRagDocs, onSelectFile, ragUploading }) {
+  const [queryText, setQueryText] = useState("");
+  const [queryResult, setQueryResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleQuery = (e) => {
     e.preventDefault();
-    if (!ragQueryText.trim()) return;
-    setRagLoading(true);
-    setRagResult(null);
+    if (!queryText.trim()) return;
+    setLoading(true);
+    setQueryResult(null);
+
     fetch(`${API_BASE}/rag/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: ragQueryText.trim() }),
+      body: JSON.stringify({ question: queryText.trim() }),
     })
       .then(r => r.json())
-      .then(d => { setRagLoading(false); if (d.ok) setRagResult(d); })
-      .catch(() => setRagLoading(false));
+      .then(d => {
+        setLoading(false);
+        if (d.ok) setQueryResult(d);
+      })
+      .catch(() => setLoading(false));
   };
 
   return (
-    <div className="panel-content">
-      <h2 className="panel-title">RAG Knowledge Base</h2>
-
-      {/* Drop zone */}
-      <div
-        className={`drop-zone ${dragOver ? "drag-active" : ""} ${ragUploading ? "uploading" : ""}`}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={handleDrop}
-        onClick={() => fileInputRef.current?.click()}
-      >
-        <input
-          type="file"
-          ref={fileInputRef}
-          style={{ display: "none" }}
-          accept=".pdf,.txt,.md,.markdown,.csv"
-          onChange={e => uploadFile(e.target.files?.[0])}
-        />
-        <div className="drop-icon">{ragUploading ? "⏳" : "📁"}</div>
-        <div className="drop-label">
-          {ragUploading ? "Indexing document…" : "Drop PDF / TXT / MD / CSV here, or click to browse"}
+    <div className="modal-content-stack">
+      {/* Upload zone */}
+      <div className="upload-drop-card" onClick={onSelectFile}>
+        <UploadCloudIcon />
+        <div className="upload-drop-title">
+          {ragUploading ? "Indexing document..." : "Click to select PDF, TXT, MD, or CSV"}
+        </div>
+        <div className="upload-drop-sub">
+          Automatic chunking and indexing into FAISS vector knowledge store
         </div>
       </div>
 
-      {/* Indexed docs */}
-      <div className="section-label">Indexed Documents ({ragDocs.length})</div>
-      <div className="doc-list">
+      {/* Catalog of indexed docs */}
+      <div className="stack-section-title">Indexed Documents ({ragDocs.length})</div>
+      <div className="documents-scroll-list">
         {ragDocs.length === 0 ? (
-          <div className="empty-hint">No documents indexed yet.</div>
-        ) : ragDocs.map((doc, i) => (
-          <div key={i} className="doc-pill">
-            <span className="doc-pill-icon">📄</span>
-            <span className="doc-pill-name">{doc.filename}</span>
-            <span className="doc-pill-meta">{doc.chunk_count} chunks • {doc.pages ?? "?"} pgs</span>
-          </div>
-        ))}
+          <div className="empty-state-text">No documents indexed yet.</div>
+        ) : (
+          ragDocs.map((d, i) => (
+            <div key={i} className="document-list-entry">
+              <FileTextIcon />
+              <span className="entry-filename">{d.filename}</span>
+              <span className="entry-meta">{d.chunk_count} chunks • {d.pages ?? 1} pgs</span>
+            </div>
+          ))
+        )}
       </div>
 
-      {/* Query */}
-      <div className="section-label">Query Knowledge Base</div>
-      <form className="rag-query-form" onSubmit={handleRagQuery}>
+      {/* Query document store */}
+      <div className="stack-section-title">Query Knowledge Base</div>
+      <form className="modal-input-row" onSubmit={handleQuery}>
         <input
           type="text"
-          className="panel-input"
-          placeholder="Ask a question about your documents…"
-          value={ragQueryText}
-          onChange={e => setRagQueryText(e.target.value)}
+          className="modal-text-input"
+          placeholder="Ask a question against your indexed documents..."
+          value={queryText}
+          onChange={e => setQueryText(e.target.value)}
         />
-        <button type="submit" className="panel-btn primary" disabled={ragLoading}>
-          {ragLoading ? "Searching…" : "Ask"}
+        <button type="submit" className="modal-action-btn primary-btn" disabled={loading}>
+          {loading ? "Searching..." : "Query"}
         </button>
       </form>
 
-      {ragResult && (
-        <div className="rag-result">
+      {queryResult && (
+        <div className="query-response-card">
           <div
-            className="rag-answer"
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(ragResult.answer) }}
+            className="query-response-text"
+            dangerouslySetInnerHTML={{ __html: renderMarkdown(queryResult.answer) }}
           />
-          {ragResult.citations?.length > 0 && (
-            <div className="citation-row">
-              {ragResult.citations.map((c, i) => (
-                <span key={i} className="citation-chip">
-                  📄 {c.source}{c.page ? ` p.${c.page}` : ""}
-                  {c.score != null && ` (${(c.score * 100).toFixed(0)}%)`}
+          {queryResult.citations?.length > 0 && (
+            <div className="citations-tray">
+              {queryResult.citations.map((c, i) => (
+                <span key={i} className="citation-tag">
+                  <FileTextIcon size={12} />
+                  <span>{c.source}{c.page ? ` p.${c.page}` : ""}</span>
+                  {c.score != null && ` (${Math.round(c.score * 100)}%)`}
                 </span>
               ))}
             </div>
@@ -243,21 +1178,27 @@ function RagPanel({ ragDocs, loadRagDocs }) {
   );
 }
 
-// ── Memory Panel ──────────────────────────────────────────────
-function MemoryPanel({ memories, loadMemories }) {
+// ── Memory Modal Content View ─────────────────────────────────
+function MemoryModalView({ memories, fetchMemories }) {
   const [newMemory, setNewMemory] = useState("");
-  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("");
 
   const handleAdd = (e) => {
     e.preventDefault();
     if (!newMemory.trim()) return;
+
     fetch(`${API_BASE}/memory/remember`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: newMemory.trim(), category: "manual" }),
     })
       .then(r => r.json())
-      .then(d => { if (d.ok) { setNewMemory(""); loadMemories(); } })
+      .then(d => {
+        if (d.ok) {
+          setNewMemory("");
+          fetchMemories();
+        }
+      })
       .catch(() => {});
   };
 
@@ -268,668 +1209,162 @@ function MemoryPanel({ memories, loadMemories }) {
       body: JSON.stringify({ content }),
     })
       .then(r => r.json())
-      .then(d => { if (d.ok) loadMemories(); })
+      .then(d => {
+        if (d.ok) fetchMemories();
+      })
       .catch(() => {});
   };
 
   const filtered = memories.filter(m =>
-    (m.content || "").toLowerCase().includes(search.toLowerCase())
+    (m.content || "").toLowerCase().includes(filter.toLowerCase())
   );
 
   return (
-    <div className="panel-content">
-      <h2 className="panel-title">Memory Vault</h2>
-      <form className="memory-add-form" onSubmit={handleAdd}>
+    <div className="modal-content-stack">
+      {/* Remember new fact */}
+      <form className="modal-input-row" onSubmit={handleAdd}>
         <input
           type="text"
-          className="panel-input"
-          placeholder="Teach JARVIS a fact, preference, or key info…"
+          className="modal-text-input"
+          placeholder="Teach JARVIS a new fact, habit, or preference..."
           value={newMemory}
           onChange={e => setNewMemory(e.target.value)}
         />
-        <button type="submit" className="panel-btn primary">Remember</button>
+        <button type="submit" className="modal-action-btn primary-btn">
+          Remember
+        </button>
       </form>
 
+      {/* Filter */}
       <input
         type="text"
-        className="panel-input search-input"
-        placeholder="Filter memories…"
-        value={search}
-        onChange={e => setSearch(e.target.value)}
+        className="modal-text-input filter-field"
+        placeholder="Filter remembered memories..."
+        value={filter}
+        onChange={e => setFilter(e.target.value)}
       />
 
-      <div className="memory-list">
+      {/* Memory cards */}
+      <div className="memory-entries-list">
         {filtered.length === 0 ? (
-          <div className="empty-hint">{memories.length === 0 ? "No memories stored yet." : "No matches."}</div>
-        ) : filtered.map((m, i) => (
-          <div key={i} className="memory-card">
-            <div className="memory-text">{m.content}</div>
-            <div className="memory-footer">
-              <span className="memory-date">{m.created_at ? new Date(m.created_at).toLocaleDateString() : ""}</span>
-              <button className="forget-btn" onClick={() => handleForget(m.content)} title="Forget">✕ Forget</button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── Telemetry Bar ─────────────────────────────────────────────
-function TelemetryBar({ stats }) {
-  if (!stats) return null;
-  const gpu = stats.gpu;
-  const vramPct = gpu ? Math.round((gpu.vram_used_mb / gpu.vram_total_mb) * 100) : null;
-
-  const bar = (pct, warn = 80, danger = 90) => {
-    const cls = pct > danger ? "tel-bar-danger" : pct > warn ? "tel-bar-warn" : "tel-bar-ok";
-    return (
-      <div className="tel-bar-wrap">
-        <div className={`tel-bar-fill ${cls}`} style={{ width: `${pct}%` }} />
-      </div>
-    );
-  };
-
-  return (
-    <div className="telemetry-bar">
-      <div className="tel-item">
-        <span className="tel-label">CPU</span>
-        {bar(stats.cpu_percent)}
-        <span className="tel-val">{stats.cpu_percent}%</span>
-      </div>
-      <div className="tel-item">
-        <span className="tel-label">RAM</span>
-        {bar(stats.ram_percent)}
-        <span className="tel-val">{stats.ram_percent}%</span>
-      </div>
-      {vramPct != null && (
-        <div className="tel-item">
-          <span className="tel-label">VRAM</span>
-          {bar(vramPct, 70, 85)}
-          <span className="tel-val">{vramPct}%</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Delete Confirmation Modal ──────────────────────────────────
-function DeleteModal({ pendingDelete, onConfirm }) {
-  if (!pendingDelete) return null;
-  return (
-    <div className="modal-backdrop">
-      <div className="modal-box danger-modal">
-        <div className="danger-badge">⚠ SECURITY CONFIRMATION</div>
-        <h2 className="modal-title">Confirm Permanent Deletion</h2>
-        <p className="modal-body-text">JARVIS is requesting to permanently delete:</p>
-        <div className="delete-target">
-          <div className="delete-name">{pendingDelete.name}</div>
-          <div className="delete-meta">{pendingDelete.is_dir ? "Directory" : "File"}</div>
-          <div className="delete-path">{pendingDelete.path}</div>
-        </div>
-        <div className="modal-actions">
-          <button className="panel-btn danger" onClick={() => onConfirm(true)}>
-            🗑 Permanently Delete
-          </button>
-          <button className="panel-btn" onClick={() => onConfirm(false)}>
-            ✕ Cancel
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── Research Modal ────────────────────────────────────────────
-function ResearchModal({ items, onClose }) {
-  const [selected, setSelected] = useState(null);
-  const fmt = (d) => d ? new Date(d).toLocaleString() : "Unknown";
-
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-box research-modal-box" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <h2 className="modal-title">Research Results</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
-        </div>
-        {selected ? (
-          <div className="research-detail">
-            <button className="back-btn" onClick={() => setSelected(null)}>← Back</button>
-            <h3>{selected.topic}</h3>
-            <div className="research-date">{fmt(selected.created_at)}</div>
-            <div className="research-report"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(selected.report || selected.summary) }} />
+          <div className="empty-state-text">
+            {memories.length === 0 ? "No memories stored in database." : "No matches found."}
           </div>
         ) : (
-          <div className="research-grid">
-            {items.length === 0 ? (
-              <div className="empty-hint">No completed research yet.</div>
-            ) : items.map((item, i) => (
-              <div key={i} className="research-card" onClick={() => setSelected(item)}>
-                <h3>{item.topic}</h3>
-                <div className="research-date">{fmt(item.created_at)}</div>
-                <p className="research-preview">{item.summary?.slice(0, 160)}…</p>
+          filtered.map((m, i) => (
+            <div key={i} className="memory-entry-card">
+              <div className="memory-entry-text">{m.content}</div>
+              <div className="memory-entry-footer">
+                <span className="entry-timestamp">
+                  {m.created_at ? new Date(m.created_at).toLocaleDateString() : ""}
+                </span>
+                <button className="entry-forget-trigger" onClick={() => handleForget(m.content)}>
+                  Forget
+                </button>
               </div>
-            ))}
-          </div>
+            </div>
+          ))
         )}
       </div>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MAIN APP
-// ═══════════════════════════════════════════════════════════════
-export default function App() {
-  // ── Connection / Status ──────────────────────────────────────
-  const [status, setStatus] = useState("idle");
-  const [backendOnline, setBackendOnline] = useState(false);
-
-  // ── Sidebar ──────────────────────────────────────────────────
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [activePanel, setActivePanel] = useState(null); // null | 'rag' | 'memory' | 'telemetry'
-
-  // ── Sessions / Chat ───────────────────────────────────────────
-  const [sessions, setSessions] = useState(() => loadSessions());
-  const [currentSessionId, setCurrentSessionId] = useState(() => {
-    const ids = Object.keys(loadSessions());
-    if (ids.length > 0) return ids[ids.length - 1];
-    const id = genId();
-    const initial = { id, name: "New Chat", messages: [], createdAt: Date.now() };
-    saveSessions({ [id]: initial });
-    return id;
-  });
-  const [inputText, setInputText] = useState("");
-  const [thinking, setThinking] = useState(false);
-  const messagesEndRef = useRef(null);
-  const inputRef = useRef(null);
-
-  // ── Google integrations ───────────────────────────────────────
-  const [calendarSummary, setCalendarSummary] = useState({ event_count: 0, events: [] });
-  const [gmailSummary, setGmailSummary] = useState({ unread_count: 0 });
-
-  // ── Research ──────────────────────────────────────────────────
-  const [researchSummary, setResearchSummary] = useState({ completed_count: 0, active_count: 0 });
-  const [completedResearch, setCompletedResearch] = useState([]);
-  const [showResearch, setShowResearch] = useState(false);
-
-  // ── System stats ──────────────────────────────────────────────
-  const [systemStats, setSystemStats] = useState(null);
-
-  // ── RAG ───────────────────────────────────────────────────────
-  const [ragDocs, setRagDocs] = useState([]);
-
-  // ── Memory ────────────────────────────────────────────────────
-  const [memories, setMemories] = useState([]);
-
-  // ── Safety ────────────────────────────────────────────────────
-  const [pendingDelete, setPendingDelete] = useState(null);
-  const [actionToast, setActionToast] = useState(null);
-
-  // ── Derived ───────────────────────────────────────────────────
-  const normalizedStatus = status === "online" ? "idle" : status;
-  const currentSession = sessions[currentSessionId] || { messages: [] };
-  const messages = currentSession.messages || [];
-
-  // ── Scroll to bottom ─────────────────────────────────────────
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, thinking]);
-
-  // ── Session helpers ───────────────────────────────────────────
-  const updateSession = useCallback((id, updater) => {
-    setSessions(prev => {
-      const updated = { ...prev, [id]: updater(prev[id] || { id, name: "New Chat", messages: [], createdAt: Date.now() }) };
-      saveSessions(updated);
-      return updated;
-    });
-  }, []);
-
-  const newChat = () => {
-    const id = genId();
-    const session = { id, name: "New Chat", messages: [], createdAt: Date.now() };
-    setSessions(prev => { const next = { ...prev, [id]: session }; saveSessions(next); return next; });
-    setCurrentSessionId(id);
-    setInputText("");
-    inputRef.current?.focus();
-  };
-
-  const deleteSession = (id, e) => {
-    e.stopPropagation();
-    setSessions(prev => {
-      const next = { ...prev };
-      delete next[id];
-      saveSessions(next);
-      if (currentSessionId === id) {
-        const remaining = Object.keys(next);
-        if (remaining.length > 0) setCurrentSessionId(remaining[remaining.length - 1]);
-        else { const nid = genId(); const s = { id: nid, name: "New Chat", messages: [], createdAt: Date.now() }; next[nid] = s; saveSessions(next); setCurrentSessionId(nid); }
-      }
-      return next;
-    });
-  };
-
-  const addMessage = (sessionId, msg) => {
-    updateSession(sessionId, sess => {
-      const newMsgs = [...(sess.messages || []), msg];
-      const name = newMsgs.find(m => m.role === "user")?.content?.slice(0, 40) || sess.name;
-      return { ...sess, messages: newMsgs, name };
-    });
-  };
-
-  // ── Loaders ───────────────────────────────────────────────────
-  const loadGmailSummary = () =>
-    fetch(`${API_BASE}/gmail/summary`).then(r => r.json()).then(d => setGmailSummary({ unread_count: d.unread_count || 0 })).catch(() => {});
-  const loadCalendarSummary = () =>
-    fetch(`${API_BASE}/calendar/summary`).then(r => r.json()).then(d => setCalendarSummary({ event_count: d.event_count || 0, events: d.events || [] })).catch(() => {});
-  const loadResearchSummary = () =>
-    fetch(`${API_BASE}/research/summary`).then(r => r.json()).then(d => setResearchSummary({ completed_count: d.completed_count || 0, active_count: d.active_count || 0 })).catch(() => {});
-  const loadSystemStats = () =>
-    fetch(`${API_BASE}/system/stats`).then(r => r.json()).then(d => { if (d.ok) setSystemStats(d); }).catch(() => {});
-  const loadRagDocs = () =>
-    fetch(`${API_BASE}/rag/documents`).then(r => r.json()).then(d => { if (d.ok) setRagDocs(d.documents || []); }).catch(() => {});
-  const loadMemories = () =>
-    fetch(`${API_BASE}/memory/all`).then(r => r.json()).then(d => { if (d.ok) setMemories(d.memories || []); }).catch(() => {});
-
-  // ── WebSocket ──────────────────────────────────────────────────
-  useEffect(() => {
-    let ws;
-    let reconnectTimer;
-
-    const connect = () => {
-      ws = new WebSocket(WS_URL);
-
-      ws.onopen = () => { setBackendOnline(true); };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data.type === "chat_message") {
-            // Messages from /chat endpoint broadcast — add to current session
-            setCurrentSessionId(sid => {
-              addMessage(sid, { id: genId(), role: data.role, content: data.content, time: now() });
-              return sid;
-            });
-            if (data.role === "assistant") setThinking(false);
-            return;
-          }
-          if (data.type === "show_completed_research") {
-            setCompletedResearch(data.items || []);
-            setShowResearch(true);
-            loadResearchSummary();
-            return;
-          }
-          if (data.type === "home") { setShowResearch(false); loadResearchSummary(); return; }
-          if (data.type === "gmail_summary") { setGmailSummary({ unread_count: data.unread_count || 0 }); return; }
-          if (data.type === "calendar_summary") { setCalendarSummary({ event_count: data.event_count || 0, events: data.events || [] }); return; }
-          if (data.type === "research_summary") { setResearchSummary({ completed_count: data.completed_count || 0, active_count: data.active_count || 0 }); return; }
-          if (data.type === "confirm_delete") { setPendingDelete(data); return; }
-          if (data.type === "rag_document_indexed") { loadRagDocs(); return; }
-          if (data.type === "computer_action_status") {
-            setActionToast(data);
-            setTimeout(() => setActionToast(null), 4000);
-            return;
-          }
-          if (data.status) setStatus(data.status.toLowerCase());
-        } catch {}
-      };
-
-      ws.onclose = () => {
-        setBackendOnline(false);
-        setStatus("offline");
-        reconnectTimer = setTimeout(connect, 3000);
-      };
-      ws.onerror = () => { ws.close(); };
-    };
-
-    connect();
-    loadGmailSummary();
-    loadCalendarSummary();
-    loadResearchSummary();
-    loadSystemStats();
-    loadRagDocs();
-    loadMemories();
-
-    const statsInterval = setInterval(loadSystemStats, 5000);
-    const summaryInterval = setInterval(loadResearchSummary, 8000);
-    const gmailInterval = setInterval(loadGmailSummary, 30000);
-    const calendarInterval = setInterval(loadCalendarSummary, 60000);
-
-    return () => {
-      clearTimeout(reconnectTimer);
-      ws.close();
-      clearInterval(statsInterval);
-      clearInterval(summaryInterval);
-      clearInterval(gmailInterval);
-      clearInterval(calendarInterval);
-    };
-  }, []);
-
-  // ── Send chat message ─────────────────────────────────────────
-  const sendMessage = async (e) => {
-    e?.preventDefault();
-    const text = inputText.trim();
-    if (!text || thinking) return;
-
-    const userMsg = { id: genId(), role: "user", content: text, time: now() };
-    addMessage(currentSessionId, userMsg);
-    setInputText("");
-    setThinking(true);
-
-    try {
-      const res = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, session_id: currentSessionId }),
-      });
-      const data = await res.json();
-      if (data.ok && data.response) {
-        const jarvisMsg = { id: genId(), role: "assistant", content: data.response, time: now() };
-        addMessage(currentSessionId, jarvisMsg);
-      }
-    } catch {
-      addMessage(currentSessionId, {
-        id: genId(), role: "assistant",
-        content: "⚠ Could not reach the JARVIS backend. Is the server running?", time: now(),
-      });
-    } finally {
-      setThinking(false);
-    }
-  };
-
-  // ── Stop speech ───────────────────────────────────────────────
-  const stopSpeech = () => {
-    fetch(`${API_BASE}/voice/stop`, { method: "POST" }).catch(() => {});
-    setStatus("idle");
-  };
-
-  // ── Delete confirmation ───────────────────────────────────────
-  const handleConfirmDelete = (confirm) => {
-    if (!pendingDelete) return;
-    fetch(`${API_BASE}/computer/confirm-delete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: pendingDelete.path, confirm }),
-    }).catch(() => {});
-    setPendingDelete(null);
-  };
-
-  // ── Keyboard shortcuts ────────────────────────────────────────
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.code === "Space" && normalizedStatus === "speaking" && document.activeElement?.tagName !== "INPUT" && document.activeElement?.tagName !== "TEXTAREA") {
-        e.preventDefault();
-        stopSpeech();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [normalizedStatus]);
-
-  // ── Render ────────────────────────────────────────────────────
-  const sortedSessions = Object.values(sessions).sort((a, b) => b.createdAt - a.createdAt);
+// ── Stats Modal Content View ──────────────────────────────────
+function StatsModalView({ stats }) {
+  if (!stats) return <div className="empty-state-text">Loading hardware metrics...</div>;
 
   return (
-    <div className={`app-shell status-${normalizedStatus}`}>
-
-      {/* ── SIDEBAR ── */}
-      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : "sidebar-closed"}`}>
-        <div className="sidebar-top">
-          <div className="sidebar-logo">
-            <div className="logo-orb">
-              <div className="logo-ring" />
-              <span className="logo-j">J</span>
-            </div>
-            {sidebarOpen && <span className="logo-text">JARVIS</span>}
-          </div>
-          <button className="sidebar-toggle" onClick={() => setSidebarOpen(v => !v)} title="Toggle sidebar">
-            {sidebarOpen ? "◀" : "▶"}
-          </button>
+    <div className="stats-cards-grid">
+      <div className="stats-card-entry">
+        <div className="metric-title">CPU Utilization</div>
+        <div className="metric-value">{stats.cpu_percent}%</div>
+        <div className="metric-meter-track">
+          <div
+            className="metric-meter-fill"
+            style={{ width: `${stats.cpu_percent}%`, background: stats.cpu_percent > 80 ? "#f43f5e" : "#38bdf8" }}
+          />
         </div>
+      </div>
 
-        {sidebarOpen && (
-          <>
-            <button className="new-chat-btn" onClick={newChat}>
-              + New Chat
-            </button>
+      <div className="stats-card-entry">
+        <div className="metric-title">System RAM</div>
+        <div className="metric-value">{stats.ram_used_gb} / {stats.ram_total_gb} GB ({stats.ram_percent}%)</div>
+        <div className="metric-meter-track">
+          <div
+            className="metric-meter-fill"
+            style={{ width: `${stats.ram_percent}%`, background: stats.ram_percent > 80 ? "#f43f5e" : "#10b981" }}
+          />
+        </div>
+      </div>
 
-            {/* Session list */}
-            <div className="session-list">
-              {sortedSessions.map(sess => (
-                <div
-                  key={sess.id}
-                  className={`session-item ${sess.id === currentSessionId ? "session-active" : ""}`}
-                  onClick={() => setCurrentSessionId(sess.id)}
-                >
-                  <span className="session-name">{sess.name}</span>
-                  <button
-                    className="session-del"
-                    onClick={e => deleteSession(sess.id, e)}
-                    title="Delete"
-                  >×</button>
-                </div>
-              ))}
-            </div>
+      <div className="stats-card-entry">
+        <div className="metric-title">Storage Drive</div>
+        <div className="metric-value">{stats.disk_used_gb} / {stats.disk_total_gb} GB ({stats.disk_percent}%)</div>
+        <div className="metric-meter-track">
+          <div className="metric-meter-fill" style={{ width: `${stats.disk_percent}%`, background: "#a855f7" }} />
+        </div>
+      </div>
 
-            {/* Panel nav */}
-            <div className="sidebar-nav">
-              <button
-                className={`nav-btn ${activePanel === "rag" ? "nav-active" : ""}`}
-                onClick={() => setActivePanel(v => v === "rag" ? null : "rag")}
-              >
-                📚 Knowledge Base
-                {ragDocs.length > 0 && <span className="nav-badge">{ragDocs.length}</span>}
-              </button>
-              <button
-                className={`nav-btn ${activePanel === "memory" ? "nav-active" : ""}`}
-                onClick={() => setActivePanel(v => v === "memory" ? null : "memory")}
-              >
-                🧠 Memory Vault
-                {memories.length > 0 && <span className="nav-badge">{memories.length}</span>}
-              </button>
-              <button
-                className={`nav-btn ${activePanel === "telemetry" ? "nav-active" : ""}`}
-                onClick={() => setActivePanel(v => v === "telemetry" ? null : "telemetry")}
-              >
-                📊 System Stats
-              </button>
-              {researchSummary.completed_count > 0 && (
-                <button
-                  className="nav-btn"
-                  onClick={() => fetch(`${API_BASE}/research/show-completed`)}
-                >
-                  🔬 Research
-                  <span className="nav-badge">{researchSummary.completed_count}</span>
-                </button>
-              )}
-            </div>
-
-            {/* Bottom status */}
-            <div className="sidebar-footer">
-              <div className="conn-status">
-                <span
-                  className="conn-dot"
-                  style={{ background: backendOnline ? "#22d3ee" : "#ef4444" }}
-                />
-                {backendOnline ? "Backend Connected" : "Backend Offline"}
-              </div>
-              {gmailSummary.unread_count > 0 && (
-                <div className="sidebar-badge email-badge">✉ {gmailSummary.unread_count} unread</div>
-              )}
-              {calendarSummary.event_count > 0 && (
-                <div className="sidebar-badge cal-badge">📅 {calendarSummary.event_count} events</div>
-              )}
-            </div>
-          </>
-        )}
-      </aside>
-
-      {/* ── MAIN AREA ── */}
-      <main className="main-area">
-
-        {/* Top bar */}
-        <header className="topbar">
-          <div className="topbar-left">
+      {stats.gpu && (
+        <div className="stats-card-entry">
+          <div className="metric-title">GPU ({stats.gpu.name})</div>
+          <div className="metric-value">
+            VRAM: {stats.gpu.vram_used_mb} / {stats.gpu.vram_total_mb} MB (
+            {Math.round((stats.gpu.vram_used_mb / stats.gpu.vram_total_mb) * 100)}%)
+          </div>
+          <div className="metric-meter-track">
             <div
-              className="status-pill"
-              style={{ "--status-color": STATUS_COLORS[normalizedStatus] || "#22d3ee" }}
-            >
-              <span className="status-dot" />
-              {STATUS_LABELS[normalizedStatus] || normalizedStatus}
-            </div>
-            {researchSummary.active_count > 0 && (
-              <div className="topbar-badge active-badge">⚡ Researching…</div>
-            )}
+              className="metric-meter-fill"
+              style={{
+                width: `${Math.round((stats.gpu.vram_used_mb / stats.gpu.vram_total_mb) * 100)}%`,
+                background: "#f59e0b",
+              }}
+            />
           </div>
-          <div className="topbar-right">
-            {normalizedStatus === "speaking" && (
-              <button className="stop-btn" onClick={stopSpeech}>
-                ■ Silence JARVIS <kbd>Space</kbd>
-              </button>
-            )}
-            {systemStats && (
-              <div className="topbar-tel">
-                <span>CPU {systemStats.cpu_percent}%</span>
-                <span>RAM {systemStats.ram_percent}%</span>
-                {systemStats.gpu && (
-                  <span>VRAM {Math.round(systemStats.gpu.vram_used_mb / systemStats.gpu.vram_total_mb * 100)}%</span>
-                )}
-              </div>
-            )}
-          </div>
-        </header>
-
-        {/* Content split: chat + optional side panel */}
-        <div className="content-row">
-
-          {/* Chat column */}
-          <div className="chat-column">
-
-            {/* Messages */}
-            <div className="messages-area">
-              {messages.length === 0 && (
-                <div className="welcome-screen">
-                  <div className="welcome-orb">
-                    <div className="orb-ring orb-ring-1" />
-                    <div className="orb-ring orb-ring-2" />
-                    <div className="orb-ring orb-ring-3" />
-                    <div className="orb-core">J</div>
-                  </div>
-                  <h1 className="welcome-title">How can I assist you?</h1>
-                  <p className="welcome-sub">JARVIS — Local AI Assistant</p>
-                  <div className="suggestion-chips">
-                    {["What's the weather today?", "Show my emails", "Take a screenshot", "What do you remember about me?"].map(s => (
-                      <button key={s} className="chip" onClick={() => { setInputText(s); inputRef.current?.focus(); }}>
-                        {s}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {messages.map(msg => <MessageBubble key={msg.id} msg={msg} />)}
-              {thinking && <TypingIndicator />}
-              <div ref={messagesEndRef} />
-            </div>
-
-            {/* Action toast */}
-            {actionToast && (
-              <div className={`action-toast ${actionToast.success ? "toast-ok" : "toast-fail"}`}>
-                {actionToast.success ? "✓" : "✗"} {actionToast.message}
-              </div>
-            )}
-
-            {/* Input */}
-            <form className="input-area" onSubmit={sendMessage}>
-              <div className="input-wrap">
-                <textarea
-                  ref={inputRef}
-                  className="chat-input"
-                  placeholder="Message JARVIS… (Enter to send, Shift+Enter for new line)"
-                  value={inputText}
-                  rows={1}
-                  onChange={e => {
-                    setInputText(e.target.value);
-                    e.target.style.height = "auto";
-                    e.target.style.height = Math.min(e.target.scrollHeight, 160) + "px";
-                  }}
-                  onKeyDown={e => {
-                    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-                  }}
-                  disabled={thinking || normalizedStatus === "offline"}
-                />
-                <button
-                  type="submit"
-                  className="send-btn"
-                  disabled={thinking || !inputText.trim() || normalizedStatus === "offline"}
-                >
-                  {thinking ? "⏳" : "↑"}
-                </button>
-              </div>
-              <div className="input-hint">
-                {normalizedStatus === "offline"
-                  ? "⚠ Backend offline — start the server"
-                  : "Enter to send • Shift+Enter for new line • Space to silence voice"}
-              </div>
-            </form>
-          </div>
-
-          {/* Side panel */}
-          {activePanel && (
-            <aside className="side-panel">
-              <div className="side-panel-header">
-                <button className="side-panel-close" onClick={() => setActivePanel(null)}>×</button>
-              </div>
-              {activePanel === "rag" && <RagPanel ragDocs={ragDocs} loadRagDocs={loadRagDocs} />}
-              {activePanel === "memory" && <MemoryPanel memories={memories} loadMemories={loadMemories} />}
-              {activePanel === "telemetry" && (
-                <div className="panel-content">
-                  <h2 className="panel-title">System Stats</h2>
-                  {systemStats ? (
-                    <>
-                      <TelemetryBar stats={systemStats} />
-                      <div className="stats-grid">
-                        <StatCard label="CPU" val={`${systemStats.cpu_percent}%`} />
-                        <StatCard label="RAM" val={`${systemStats.ram_used_gb} / ${systemStats.ram_total_gb} GB`} />
-                        <StatCard label="RAM %" val={`${systemStats.ram_percent}%`} />
-                        <StatCard label="Disk" val={`${systemStats.disk_used_gb} / ${systemStats.disk_total_gb} GB`} />
-                        {systemStats.battery_percent != null && (
-                          <StatCard label="Battery" val={`${systemStats.battery_percent}% ${systemStats.battery_plugged ? "⚡" : ""}`} />
-                        )}
-                        {systemStats.gpu && (
-                          <>
-                            <StatCard label="GPU" val={systemStats.gpu.name} />
-                            <StatCard label="VRAM" val={`${systemStats.gpu.vram_used_mb} / ${systemStats.gpu.vram_total_mb} MB`} />
-                            <StatCard label="GPU Load" val={`${systemStats.gpu.utilization_pct}%`} />
-                          </>
-                        )}
-                      </div>
-                    </>
-                  ) : (
-                    <div className="empty-hint">Loading system stats…</div>
-                  )}
-                </div>
-              )}
-            </aside>
-          )}
         </div>
-      </main>
-
-      {/* ── MODALS ── */}
-      <DeleteModal pendingDelete={pendingDelete} onConfirm={handleConfirmDelete} />
-      {showResearch && (
-        <ResearchModal items={completedResearch} onClose={() => setShowResearch(false)} />
       )}
     </div>
   );
 }
 
-function StatCard({ label, val }) {
+// ── Research Modal Content View ───────────────────────────────
+function ResearchModalView({ items }) {
+  const [activeItem, setActiveItem] = useState(null);
+
+  if (items.length === 0) {
+    return <div className="empty-state-text">No research reports currently saved.</div>;
+  }
+
+  if (activeItem) {
+    return (
+      <div className="research-article-view">
+        <button className="back-nav-trigger" onClick={() => setActiveItem(null)}>
+          ← Back to all reports
+        </button>
+        <h3 className="article-title">{activeItem.topic}</h3>
+        <div className="article-date">
+          {activeItem.created_at ? new Date(activeItem.created_at).toLocaleString() : ""}
+        </div>
+        <div
+          className="article-body"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(activeItem.report || activeItem.summary) }}
+        />
+      </div>
+    );
+  }
+
   return (
-    <div className="stat-card">
-      <div className="stat-label">{label}</div>
-      <div className="stat-val">{val}</div>
+    <div className="research-cards-grid">
+      {items.map((it, idx) => (
+        <div key={idx} className="research-summary-card" onClick={() => setActiveItem(it)}>
+          <div className="summary-topic">{it.topic}</div>
+          <div className="summary-date">
+            {it.created_at ? new Date(it.created_at).toLocaleDateString() : ""}
+          </div>
+          <p className="summary-snippet">{it.summary?.slice(0, 160)}...</p>
+        </div>
+      ))}
     </div>
   );
 }

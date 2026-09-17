@@ -280,9 +280,19 @@ def generate_cached_audio(text: str, audio_path: str, hash_path: str):
                 sf.write(str(audio_file), full_audio, 24000)
                 print(f"⚡ [TTS Cache] Local GPU WAV asset successfully baked to disk.")
         else:
-            # Fallback: Run legacy async cloud workflow to output compressed MP3
+            # Fallback: Run async cloud workflow to output compressed MP3
             import asyncio
-            asyncio.run(generate_audio_file_async(text, str(audio_file)))
+            import concurrent.futures
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    pool.submit(lambda: asyncio.run(generate_audio_file_async(text, str(audio_file)))).result(timeout=15)
+            else:
+                asyncio.run(generate_audio_file_async(text, str(audio_file)))
             print(f"☁️ [TTS Cache] Standard Cloud MP3 asset downloaded successfully.")
             
         # Write matching validation verification hash file

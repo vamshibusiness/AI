@@ -48,7 +48,7 @@ def open_application(app_name: str) -> dict:
         }
 
     # Special protocol handlers (e.g. ms-settings:)
-    if app_info.get("protocol"):
+    if isinstance(app_info, dict) and app_info.get("protocol"):
         try:
             os.system(f"start {app_info['protocol']}")
             time.sleep(1.0)
@@ -62,7 +62,7 @@ def open_application(app_name: str) -> dict:
         except Exception as e:
             return {"success": False, "action": "open_application", "target": app_name, "error": str(e)}
 
-    exe = app_info.get("exe")
+    exe = app_info if isinstance(app_info, str) else app_info.get("exe", "")
     resolved_path = _find_exe(exe) if exe else None
 
     try:
@@ -121,7 +121,7 @@ def close_application(app_name: str) -> dict:
             "error": f"'{app_name}' is not in the allowed application list.",
         }
 
-    exe = (app_info.get("exe") or "").lower().replace(".exe", "")
+    exe = (app_info if isinstance(app_info, str) else app_info.get("exe") or "").lower().replace(".exe", "")
     closed_pids = []
 
     for proc in psutil.process_iter(['name', 'pid']):

@@ -38,6 +38,9 @@ active_research.json
 research_history.json
 inbox.json
 tasks.json
+backend/assets/active_calendar_reminders.json
+backend/assets/wake_response.*
+backend/assets/rag/doc_hashes.json
 
 # Test & coverage caches
 .pytest_cache/

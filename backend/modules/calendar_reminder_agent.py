@@ -110,22 +110,12 @@ class CalendarReminderAgent:
         return "Calendar reminder agent started."
 
     def _get_cached_calendar_summary(self) -> dict:
-        
-        try:
-            response = requests.get(
-                "http://localhost:8000/calendar/summary",
-                timeout=2,
-            )
-
-            if not response.ok:
-                print(f"[Calendar Reminder Agent] Calendar summary failed: {response.status_code}")
-                return {"events": []}
-
-            return response.json()
-
-        except requests.RequestException as e:
-            print(f"[Calendar Reminder Agent] Could not reach calendar summary endpoint: {e}")
-            return {"events": []}
+        summary_path = Path("assets/calendar_summary.json")
+        if not summary_path.exists():
+            summary_path = Path("backend/assets/calendar_summary.json")
+        if summary_path.exists():
+            return self._read_json_file(summary_path, {"events": []})
+        return {"events": []}
 
     def _parse_event_start(self, start_raw: str):
         if not start_raw or "T" not in start_raw:

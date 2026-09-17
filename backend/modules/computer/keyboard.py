@@ -15,7 +15,7 @@ def _get_pyautogui():
     global _pyautogui
     if _pyautogui is None:
         import pyautogui
-        pyautogui.FAILSAFE = True
+        pyautogui.FAILSAFE = False
         _pyautogui = pyautogui
     return _pyautogui
 
@@ -38,9 +38,7 @@ def type_text(text: str, app: str = "", interval: float = 0.04) -> dict:
 
         if app:
             from backend.modules.computer.applications import focus_application
-            res = focus_application(app)
-            if not res["success"]:
-                return res
+            focus_application(app)
             time.sleep(0.3)
 
         pg.typewrite(safe, interval=interval)

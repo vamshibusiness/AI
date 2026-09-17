@@ -585,71 +585,213 @@ async def vision_ocr():
 
 
 # ==============================================================
+# VOICE TRIGGER ENDPOINT — Trigger wake/listening from UI mic
+# ==============================================================
+
+@app.post("/voice/trigger")
+async def voice_trigger():
+    """Trigger JARVIS voice listening pipeline from UI microphone button."""
+    try:
+        from backend.modules.wakeword.listener import wake_queue
+        wake_queue.put("trigger")
+        return {"ok": True, "message": "Voice listening triggered"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+# ==============================================================
 # CHAT ENDPOINT — Text-based conversation (UI chat panel)
 # ==============================================================
 
-# In-process short-term conversation history (resets on backend restart)
-_chat_history: list = []
+from backend.modules.memory_manager import load_user_profile
+
+# In-process conversation sessions keyed by session_id
+_chat_sessions: dict = {}
+
+
+def _get_chat_history(session_id: str, current_message: str) -> list:
+    """
+    Construct full conversation history with system prompt, user profile,
+    and long-term memory context, appending the current message so
+    local LLM receives the complete prompt.
+    """
+    global _chat_sessions
+
+    if session_id not in _chat_sessions:
+        user_facts = load_user_profile()
+        memory_ctx = get_memory_context_prompt()
+        profile_context = ""
+        if user_facts:
+            profile_context += "\nCore details you know about the user:\n" + "\n".join([f"- {fact}" for fact in user_facts])
+        if memory_ctx:
+            profile_context += "\n" + memory_ctx
+
+        system_prompt = (
+            "You are Jarvis, a highly intelligent, sharp, and articulate AI assistant created for Vamshi Krishna. "
+            "Your tone is polished, calm, and effortlessly capable, with a hint of dry wit. "
+            "Answer directly and helpfully. Use clean Markdown with code blocks where appropriate."
+            f"{profile_context}"
+        )
+        _chat_sessions[session_id] = [{"role": "system", "content": system_prompt}]
+
+    # Append current message to session history
+    _chat_sessions[session_id].append({"role": "user", "content": current_message})
+
+    # Rolling window: keep system prompt + last 14 message turns
+    if len(_chat_sessions[session_id]) > 15:
+        _chat_sessions[session_id] = [_chat_sessions[session_id][0]] + _chat_sessions[session_id][-14:]
+
+    return _chat_sessions[session_id]
+
+
+@app.post("/ws/broadcast")
+async def ws_broadcast_endpoint(body: dict):
+    """Broadcast an arbitrary event to all connected WebSocket clients."""
+    await broadcast_message(body)
+    return {"ok": True}
 
 
 @app.post("/chat")
 async def chat(body: dict):
     """
     Accept a text message from the UI chat panel, route it through the
-    existing JARVIS intent router, and return the text response.
+    existing JARVIS intent router without TTS speech, and return the response.
 
-    Also broadcasts user + assistant messages via WebSocket so all
-    connected clients (including multi-tab) stay in sync.
-
-    Body: { "message": "...", "session_id": "..." }
-    Returns: { "ok": true, "response": "...", "status": "..." }
+    Body: { "message": "...", "session_id": "...", "msg_id": "..." }
+    Returns: { "ok": true, "response": "...", "session_id": "...", "msg_id": "..." }
     """
-    global _chat_history
-
     message = (body.get("message") or "").strip()
+    session_id = body.get("session_id") or "default"
+    msg_id = body.get("msg_id") or ""
+
     if not message:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Message is required."})
 
-    # Broadcast: user is typing / thinking starts
     await broadcast_status("thinking")
-    await broadcast_message({
-        "type": "chat_message",
-        "role": "user",
-        "content": redact_secrets(message),
-    })
 
     try:
-        # Route through the existing intent system (same as voice pipeline)
+        # Build full conversation history containing the system prompt and current user message
+        history = _get_chat_history(session_id, message)
+
+        # Route through intent system with speak_response=False (Chat Mode MUST NOT speak)
         response = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: route_command(message, _chat_history),
+            lambda: route_command(message, history, speak_response=False),
         )
 
+        reply_text = str(response) if response else "I processed your request, sir, but have no additional report."
+
+        # Record assistant reply in rolling history
+        history.append({"role": "assistant", "content": reply_text})
+
         # Persist conversation turn in memory store
-        add_conversation_turn("ui_chat", "user", message)
-        add_conversation_turn("ui_chat", "assistant", response or "")
-
-        # Keep a short rolling in-memory history for context
-        _chat_history.append({"role": "user", "content": message})
-        _chat_history.append({"role": "assistant", "content": response or ""})
-        if len(_chat_history) > 20:
-            _chat_history = _chat_history[-20:]
-
-        # Broadcast the assistant reply
-        await broadcast_message({
-            "type": "chat_message",
-            "role": "assistant",
-            "content": response or "I'm sorry, I couldn't process that request.",
-        })
+        try:
+            add_conversation_turn(session_id, "user", message)
+            add_conversation_turn(session_id, "assistant", reply_text)
+        except Exception:
+            pass
 
         await broadcast_status("idle")
 
         return {
             "ok": True,
-            "response": response,
+            "response": reply_text,
+            "session_id": session_id,
+            "msg_id": msg_id,
         }
 
     except Exception as e:
         await broadcast_status("idle")
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+@app.post("/chat/stream")
+async def chat_stream(body: dict):
+    """
+    Streaming SSE endpoint for Chat Mode.
+    Progressively streams tokens from local Ollama without TTS audio playback.
+    """
+    from fastapi.responses import StreamingResponse
+    import json
+    import threading
+
+    message = (body.get("message") or "").strip()
+    session_id = body.get("session_id") or "default"
+    msg_id = body.get("msg_id") or ""
+
+    if not message:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Message is required."})
+
+    await broadcast_status("thinking")
+
+    async def event_generator():
+        try:
+            history = _get_chat_history(session_id, message)
+
+            # Check if specialized tool handler matches (computer, calendar, research, etc.)
+            from backend.router.registry import INTENT_HANDLERS
+            from backend.modules.llm.chat_intent import ChatHandler
+
+            special_handler = None
+            for h in INTENT_HANDLERS:
+                if not isinstance(h, ChatHandler) and h.is_related(message):
+                    special_handler = h
+                    break
+
+            if special_handler:
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: special_handler.handle(message, history=history)
+                )
+                reply_text = str(resp) if resp else "Task completed, sir."
+                history.append({"role": "assistant", "content": reply_text})
+                try:
+                    add_conversation_turn(session_id, "user", message)
+                    add_conversation_turn(session_id, "assistant", reply_text)
+                except Exception:
+                    pass
+                yield f"data: {json.dumps({'chunk': reply_text, 'done': True, 'msg_id': msg_id})}\n\n"
+            else:
+                from backend.modules.llm.local_llm import ask_local_llm_stream
+                full_reply = []
+                loop = asyncio.get_event_loop()
+                token_queue = asyncio.Queue()
+
+                def sync_stream_worker():
+                    try:
+                        for tok in ask_local_llm_stream(history):
+                            if tok:
+                                loop.call_soon_threadsafe(token_queue.put_nowait, tok)
+                    except Exception as err:
+                        print(f"[sync_stream_worker error] {err}")
+                    finally:
+                        loop.call_soon_threadsafe(token_queue.put_nowait, None)
+
+                threading.Thread(target=sync_stream_worker, daemon=True).start()
+
+                while True:
+                    tok = await token_queue.get()
+                    if tok is None:
+                        break
+                    full_reply.append(tok)
+                    yield f"data: {json.dumps({'chunk': tok, 'done': False, 'msg_id': msg_id})}\n\n"
+
+                final_text = "".join(full_reply)
+                history.append({"role": "assistant", "content": final_text})
+                try:
+                    add_conversation_turn(session_id, "user", message)
+                    add_conversation_turn(session_id, "assistant", final_text)
+                except Exception:
+                    pass
+                yield f"data: {json.dumps({'chunk': '', 'done': True, 'msg_id': msg_id})}\n\n"
+
+            await broadcast_status("idle")
+
+        except Exception as e:
+            await broadcast_status("idle")
+            yield f"data: {json.dumps({'error': str(e), 'done': True, 'msg_id': msg_id})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 

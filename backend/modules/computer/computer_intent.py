@@ -226,8 +226,22 @@ class ComputerHandler:
         # Execute steps
         responses = []
         for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
             tool = step.get("tool", "")
             args = step.get("arguments", {})
+            if isinstance(args, str):
+                if tool in ("open_application", "close_application"):
+                    args = {"application": args}
+                elif tool == "type_text":
+                    args = {"text": args}
+                elif tool in ("open_website", "web_search"):
+                    args = {"site": args, "query": args}
+                else:
+                    args = {"target": args}
+            elif not isinstance(args, dict):
+                args = {}
+
             desc = _step_description(tool, args)
             _broadcast_action_status("running", f"⚙ {desc}...", True)
 
